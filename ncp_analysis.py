@@ -156,57 +156,85 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
     pml_file = f"{output_prefix}_visualization.pml"
     stack_pdb_file = f"{output_prefix}_stack.pdb"
     
-    def format_vec(v): return f"[{v[0]:.3f}, {v[1]:.3f}, {v[2]:.3f}]"
+    def format_vec(v):
+        return f"[{v[0]:.3f}, {v[1]:.3f}, {v[2]:.3f}]"
 
-    cgo_objects = []
+    script_lines = []
+    script_lines.append(f"load {stack_pdb_file}, main_obj")
+    script_lines.extend(["bg_color white", "hide everything", "show cartoon", "util.cbc"])
+
     colors = ["palecyan", "lightorange", "lightmagenta", "palegreen"]
     
+    # 1. Create selections for each NCP with precise residue ranges
+    for i, ncp_def in enumerate(ncp_configs):
+        ncp_name = f"ncp{ncp_def['id']}"
+        color = colors[i % len(colors)]
+        h_selectors = [f"(chain {c} and resi {HISTONE_CORE_RANGES[histone_map[c]][0]}-{HISTONE_CORE_RANGES[histone_map[c]][1]})" for c in ncp_def['histone_chains']]
+        d_selectors = [f"(chain {seg[0]} and resi {int(seg[1])}-{int(seg[2])})" for seg in ncp_def['dna_segments']]
+        script_lines.append(f"select {ncp_name}, {' or '.join(h_selectors + d_selectors)}")
+        script_lines.append(f"color {color}, {ncp_name}")
+
+    # 2. Identify and color overlapping DNA regions
+    if len(ncp_configs) > 1:
+        for i in range(len(ncp_configs) - 1):
+            ncp1_segs = ncp_configs[i]['dna_segments']
+            ncp2_segs = ncp_configs[i+1]['dna_segments']
+            for seg1_chain, seg1_start, seg1_end in ncp1_segs:
+                for seg2_chain, seg2_start, seg2_end in ncp2_segs:
+                    if seg1_chain == seg2_chain:
+                        overlap_start = max(int(seg1_start), int(seg2_start))
+                        overlap_end = min(int(seg1_end), int(seg2_end))
+                        if overlap_start < overlap_end:
+                            sel_name = f"overlap_{i+1}_{i+2}_{seg1_chain}"
+                            script_lines.append(f"select {sel_name}, chain {seg1_chain} and resi {overlap_start}-{overlap_end}")
+                            script_lines.append(f"color hotpink, {sel_name}")
+                            script_lines.append(f"show sticks, {sel_name}")
+
+    # 3. Draw basis vectors and planes
     for i, ncp in enumerate(ncp_bases):
         ncp_id = ncp['id']
         com, axis, normal = ncp['com'], ncp['axis'], ncp['normal']
         color = colors[i % len(colors)]
-        cgo_objects.extend([f"cgo_arrow {format_vec(com)}, {format_vec(com + axis * 30)}, radius=0.4, color=red, name=axis{ncp_id}",
-                            f"cgo_arrow {format_vec(com)}, {format_vec(com + normal * 30)}, radius=0.4, color=blue, name=normal{ncp_id}"])
-        cgo_objects.append("BEGIN, TRIANGLE_FAN")
-        cgo_objects.append(f"COLOR, {color}")
-        cgo_objects.append(f"ALPHA, 0.4")
-        cgo_objects.append(f"VERTEX, {com[0]:.3f}, {com[1]:.3f}, {com[2]:.3f}")
-        v_ref = np.cross(normal, axis) / np.linalg.norm(np.cross(normal, axis))
-        for k in range(37):
-            angle = k * 10 * np.pi / 180
+        script_lines.append(f"pseudoatom com{ncp_id}, pos={format_vec(com)}, color={color}, sphere_scale=1.0")
+        script_lines.append(f"cgo_arrow {format_vec(com)}, {format_vec(com + axis * 20)}, radius=0.3, color=red, name=axis{ncp_id}")
+        script_lines.append(f"cgo_arrow {format_vec(com)}, {format_vec(com + normal * 20)}, radius=0.3, color=blue, name=normal{ncp_id}")
+        
+        v_ref = np.cross(normal, axis)
+        v_ref /= np.linalg.norm(v_ref)
+        disk_cgo = [f"BEGIN, TRIANGLE_FAN, COLOR, {color}, ALPHA, 0.6, VERTEX, {com[0]:.3f}, {com[1]:.3f}, {com[2]:.3f}"]
+        for k in range(41):
+            angle = k * 9 * np.pi / 180
             pt = com + 40 * (np.cos(angle) * v_ref + np.sin(angle) * np.cross(normal, v_ref))
-            cgo_objects.append(f"VERTEX, {pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}")
-        cgo_objects.append("END")
+            disk_cgo.append(f"VERTEX, {pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}")
+        disk_cgo.append("END")
+        script_lines.append(f"load_cgo([ { ', '.join(disk_cgo)} ], plane{ncp_id}, 1)")
 
+    # 4. Draw stacking parameters and labels
     if all_params:
         params = all_params[0]
         ncp1, ncp2 = ncp_bases[0], ncp_bases[1]
-        label_pos = (ncp1['com'] + ncp2['com']) / 2.0
+        c1, c2 = ncp1['com'], ncp2['com']
+        script_lines.append(f"cgo_arrow {format_vec(c1)}, {format_vec(c2)}, radius=0.3, color=black, name=dist_vec")
+        
+        label_pos = (c1 + c2) / 2.0
         y_offset = 0
+        script_lines.append(f'# --- Stacking Parameter Labels ---')
         for key, value in params.items():
             unit = " A" if key in ["Distance", "Rise", "Shift"] else " deg"
             label_text = f'{key}: {value:.1f}{unit}'
-            pos = label_pos + np.array([25, y_offset, 0])
-            cgo_objects.append(f"pseudoatom label_{key.replace(' ','_')}, pos={format_vec(pos)}")
-            cgo_objects.append(f'label label_{key.replace(" ","_")}, "{label_text}" ')
-            y_offset -= 6
+            label_name = f"label_{key.replace(' ','_')}"
+            script_lines.append(f'pseudoatom {label_name}, pos={format_vec(label_pos + np.array([40, y_offset, 0]))}')
+            script_lines.append(f'label {label_name}, "{label_text}"')
+            y_offset -= 8
+        script_lines.extend(["set label_color, black, label_*", "set label_size, 20", "set label_font_id, 7"])
 
-    script = [f"load {stack_pdb_file}", "bg_color white", "hide everything", "show cartoon", "set cartoon_transparency, 0.5"]
-    for i, ncp_def in enumerate(ncp_configs):
-        ncp_name = f"ncp{ncp_def['id']}"
-        h_selectors = [f"(chain {c} and resi {HISTONE_CORE_RANGES[histone_map[c]][0]}-{HISTONE_CORE_RANGES[histone_map[c]][1]})" for c in ncp_def['histone_chains']]
-        d_selectors = [f"(chain {seg[0]} and resi {seg[1]}-{seg[2]})" for seg in ncp_def['dna_segments']]
-        script.append(f"select {ncp_name}, {' or '.join(h_selectors + d_selectors)}")
-        script.append(f"color {colors[i % len(colors)]}, {ncp_name}")
-    
-    script.append(f"load_cgo([{', '.join(cgo_objects)}], viz, 1)")
-    script.append("set label_color, black, label_*")
-    script.append("set label_size, -0.8")
-    script.append("hide labels, label_*")
-    script.append("zoom center")
+    script_lines.append("hide labels, com*")
+    script_lines.append("group basis_vectors, com* axis* normal* plane*")
+    script_lines.append("group labels, label_*")
+    script_lines.append("zoom visible")
 
     with open(pml_file, 'w') as f:
-        f.write("\n".join(script))
+        f.write("\n".join(script_lines))
     print(f"Generated PyMOL script: {pml_file}")
 
 def main():
@@ -236,7 +264,12 @@ def main():
         basis = calculate_ncp_basis(ncp_def, all_chains_map, histone_map)
         if basis: ncp_bases.append({'id': ncp_def['id'], **basis})
 
-    if len(ncp_bases) < 2: return print("Analysis requires at least two valid NCPs. Aborting.")
+    if len(ncp_bases) < 2:
+        print("Analysis requires at least two valid NCPs. Aborting.")
+        # Still generate a pml script for the single NCP if it exists
+        if len(ncp_bases) == 1:
+            generate_pymol_script(output_prefix, ncps_config, ncp_bases, [], histone_map)
+        return
 
     ncp_bases.sort(key=lambda x: x['id'])
     all_params = [calculate_stacking_parameters(ncp_bases[i], ncp_bases[i+1]) for i in range(len(ncp_bases) - 1)]
@@ -264,3 +297,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

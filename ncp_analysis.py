@@ -212,8 +212,8 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
 def main():
     parser = argparse.ArgumentParser(description="Calculate NCP stacking parameters and generate visualization.")
     parser.add_argument("pdb_file", help="Path to the input PDB file.")
-    parser.add_argument("--config", required=True, help="Path to the NCP configuration file.")
-    parser.add_argument("--output-prefix", default=None, help="Prefix for all output files. Defaults to PDB filename.")
+    parser.add_argument("-c", "--config", required=True, help="Path to the NCP configuration file.")
+    parser.add_argument("-o", "--output-prefix", default=None, help="Prefix for all output files. Defaults to the basename of PDB filename.")
     args = parser.parse_args()
 
     if not os.path.exists(args.pdb_file): return print(f"Error: PDB file not found at {args.pdb_file}")

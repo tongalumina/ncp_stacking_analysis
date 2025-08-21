@@ -201,8 +201,8 @@ def generate_config_file(pdb_id, ncp_octamers, histone_map, structure, output_fi
 def main():
     parser = argparse.ArgumentParser(description="Identify NCPs and features for analysis.")
     parser.add_argument("pdb_file", help="Path to the input PDB file.")
-    parser.add_argument("--histone-fasta", required=True, help="Path to FASTA file of canonical histone sequences.")
-    parser.add_argument("--output-config", default=None, help="Output config file. Defaults to <pdb_filename>_config.txt")
+    parser.add_argument("-f", "--histone-fasta", default="histones.fa", help="Path to FASTA file of canonical histone sequences (default: histones.fa")
+    parser.add_argument("-o", "--output-config", default=None, help="Output config file. Defaults to <pdb_filename>_config.txt")
     args = parser.parse_args()
 
     if not os.path.exists(args.pdb_file): return print(f"Error: PDB file not found: {args.pdb_file}")

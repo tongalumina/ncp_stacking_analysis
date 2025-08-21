@@ -3,21 +3,7 @@
 ncp_identification.py
 
 Identifies histone octamers (NCPs) and key DNA features from a PDB file.
-
-Workflow:
-1.  Reads a PDB structure.
-2.  Extracts protein sequences and identifies histone chains (H2A, H2B, H3, H4)
-    by running a BLAST search against a user-provided histone sequence database.
-3.  Clusters the identified histones into octamers based on proximity.
-4.  For each NCP, identifies the central DNA base pair that defines the local
-    symmetry axis. This is done by finding the midpoint between the two
-    C-alpha atoms of Arginine 49 (R49) on the two H3 histones, and then
-    finding the closest DNA base pair to this point.
-5.  Identifies the 147bp DNA segments wrapped around each octamer.
-6.  Writes the results to a configuration file for downstream analysis.
-
-Usage:
-python ncp_identification.py <PDB_FILE> --histone-fasta <FASTA_FILE> --output-config <CONFIG_FILE>
+Implements a robust, symmetry-based method for finding the central dyad axis.
 """
 
 import argparse
@@ -37,359 +23,216 @@ warnings.filterwarnings("ignore", category=PDBConstructionWarning)
 
 # --- Constants ---
 DNA_RESIDUES = ['DA', 'DC', 'DG', 'DT']
-INTERACTION_DISTANCE = 10.0  # Angstroms
+INTERACTION_DISTANCE = 10.0
+NCP_DNA_LENGTH = 147
 
-def get_chain_sequences(structure):
-    """Extracts protein sequences from a PDB structure."""
-    sequences = {}
-    for chain in structure.get_chains():
-        seq = ""
-        # Reset residue list for each chain
-        residues = list(chain.get_residues())
-        for residue in residues:
-            # Skip non-protein or DNA residues
-            if residue.get_resname().strip() in DNA_RESIDUES or 'CA' not in residue:
-                continue
-            res_name = residue.get_resname().strip().title()
-            one_letter_code = protein_letters_3to1_extended.get(res_name, 'X')
-            seq += one_letter_code
-        if seq:
-            sequences[chain.id] = SeqRecord(Seq(seq), id=chain.id, description="")
-    return sequences
-
-def identify_histones_by_blast(sequences, db_path):
-    """Identifies histone type for each chain using BLASTP."""
-    histone_map = {}
-    # Create a temporary file for all sequences
-    temp_fasta_query = "temp_query.fasta"
-    SeqIO.write(sequences.values(), temp_fasta_query, "fasta")
-
-    # Run BLASTP
-    cmd = [
-        "blastp", "-query", temp_fasta_query, "-db", db_path,
-        "-outfmt", "6 qseqid sseqid pident", "-max_target_seqs", "1"
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"Error running BLAST: {e}")
-        print("Please ensure NCBI BLAST+ is installed and in your system's PATH.")
-        os.remove(temp_fasta_query)
-        return None
-
-    os.remove(temp_fasta_query)
-
-    # Process BLAST results
-    for line in result.stdout.strip().split('\n'):
-        if not line:
-            continue
-        parts = line.split()
-        chain_id, subject_id, pident = parts[0], parts[1], float(parts[2])
-        histone_type = subject_id.split('_')[0] # Assuming DB format like 'H3_human'
-        if pident > 50:  # Confidence threshold
-            histone_map[chain_id] = histone_type
-
-    return histone_map
-
+# --- Helper Functions ---
 def get_center_of_mass(entity_or_atom_list):
-    """Calculates the center of mass of a PDB entity or a list of atoms."""
-    if hasattr(entity_or_atom_list, 'get_atoms'): # It's an entity
+    if hasattr(entity_or_atom_list, 'get_atoms'):
         atom_list = list(entity_or_atom_list.get_atoms())
-    else: # Assume it's a list of atoms
+    else:
         atom_list = entity_or_atom_list
-    
-    if not atom_list:
-        return None
+    if not atom_list: return None
     coords = [atom.get_coord() for atom in atom_list]
     return np.mean(coords, axis=0)
 
-def cluster_chains_into_ncps(structure, histone_map):
-    """Clusters histone chains into octamers based on proximity."""
-    histone_chains = {chain.id: chain for chain in structure.get_chains() if chain.id in histone_map}
-    if not histone_chains:
-        return []
-
-    # Pre-calculate COMs for all histone chains
-    chain_coms = {cid: get_center_of_mass(c) for cid, c in histone_chains.items()}
-    
-    # Group chains by histone type
-    chains_by_type = defaultdict(list)
-    for chain_id, h_type in histone_map.items():
-        chains_by_type[h_type].append(histone_chains[chain_id])
-
-    ncp_histone_octamers = []
-    assigned_chain_ids = set()
-
-    # Use H3 as a seed for clustering
-    if not chains_by_type['H3']:
-        return []
-
-    for h3_chain in chains_by_type['H3']:
-        if h3_chain.id in assigned_chain_ids:
-            continue
-
-        h3_com = chain_coms[h3_chain.id]
-        
-        # Find the 7 closest histone chains
-        unassigned_chains = [(cid, com) for cid, com in chain_coms.items() if cid not in assigned_chain_ids and cid != h3_chain.id]
-        unassigned_chains.sort(key=lambda x: np.linalg.norm(h3_com - x[1]))
-        
-        closest_7_ids = [cid for cid, com in unassigned_chains[:7]]
-        potential_octamer_ids = [h3_chain.id] + closest_7_ids
-        
-        # Check stoichiometry
-        stoichiometry = defaultdict(int)
-        for cid in potential_octamer_ids:
-            stoichiometry[histone_map[cid]] += 1
-            
-        is_octamer = (stoichiometry['H3'] == 2 and stoichiometry['H4'] == 2 and
-                      stoichiometry['H2A'] == 2 and stoichiometry['H2B'] == 2)
-
-        if is_octamer:
-            octamer_chains = [histone_chains[cid] for cid in potential_octamer_ids]
-            ncp_histone_octamers.append(octamer_chains)
-            assigned_chain_ids.update(potential_octamer_ids)
-
-    # Sort NCPs by Z-coordinate of their COM for consistent ordering
-    ncp_histone_octamers.sort(key=lambda octamer: get_center_of_mass([atom for chain in octamer for atom in chain.get_atoms()]).tolist()[2])
-    return ncp_histone_octamers
-
-def find_watson_crick_partner(target_res, partner_strand_residues):
-    """    Finds the best partner for a residue.
-    1. Tries to find the best complementary partner based on H-bond atom distance.
-    2. If no complement is found, falls back to the geometrically closest residue.
-    Returns a tuple: (partner_residue, distance, is_complementary_flag).
-    """
+def find_partner_for_residue(target_res, partner_strand_residues):
     COMPLEMENTS = {'DA': 'DT', 'DT': 'DA', 'DC': 'DG', 'DG': 'DC'}
-    PURINES = ['DA', 'DG']
-
-    target_res_name = target_res.get_resname().strip()
-    complement_name = COMPLEMENTS.get(target_res_name)
-
-    best_partner = None
-    min_dist = float('inf')
-    is_complementary = False
-
-    # 1. First, search for the best COMPLEMENTARY partner
-    if complement_name:
-        try:
-            target_atom = target_res['N1'] if target_res_name in PURINES else target_res['N3']
-            for partner_res in partner_strand_residues:
-                if partner_res.get_resname().strip() == complement_name:
-                    try:
-                        partner_atom = partner_res['N1'] if partner_res.get_resname().strip() in PURINES else partner_res['N3']
-                        dist = target_atom - partner_atom
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_partner = partner_res
-                    except KeyError:
-                        continue
-            if best_partner:
-                is_complementary = True
-        except KeyError:
-            pass # Target atom not found, will proceed to geometric search
-
-    # 2. If no complementary partner found, fall back to GEOMETRIC closest
-    if not best_partner:
-        target_com = get_center_of_mass(target_res)
-        for partner_res in partner_strand_residues:
-            dist = np.linalg.norm(target_com - get_center_of_mass(partner_res))
+    target_name = target_res.get_resname().strip()
+    complement_name = COMPLEMENTS.get(target_name)
+    if not complement_name: return None
+    best_partner, min_dist = None, float('inf')
+    target_com = get_center_of_mass(target_res)
+    for res in partner_strand_residues:
+        if res.get_parent().id != target_res.get_parent().id and res.get_resname().strip() == complement_name:
+            dist = np.linalg.norm(target_com - get_center_of_mass(res))
             if dist < min_dist:
-                min_dist = dist
-                best_partner = partner_res
-        is_complementary = False # It's a geometric match
+                min_dist, best_partner = dist, res
+    if min_dist < 15.0: return best_partner
+    return None
 
-    return best_partner, min_dist, is_complementary
+# --- Core Logic ---
+def get_chain_sequences(structure):
+    sequences = {}
+    for chain in structure.get_chains():
+        seq = ""
+        for residue in chain:
+            if residue.get_resname().strip() in DNA_RESIDUES or 'CA' not in residue: continue
+            res_name = residue.get_resname().strip().title()
+            one_letter_code = protein_letters_3to1_extended.get(res_name, 'X')
+            seq += one_letter_code
+        if seq: sequences[chain.id] = SeqRecord(Seq(seq), id=chain.id, description="")
+    return sequences
 
-def find_central_bp_and_dna_segment(structure, octamer, histone_map):
-    """
-    Identifies the central base pair and the 147bp DNA segment for an NCP.
-    """
-    # 1. Find H3 R49 anchor point
-    h3_chains = [c for c in octamer if histone_map[c.id] == 'H3']
-    if len(h3_chains) != 2:
-        return None, None, None
-
+def identify_histones_by_blast(sequences, db_path):
+    histone_map = {}
+    temp_fasta_query = f"temp_query_{os.getpid()}.fasta"
+    SeqIO.write(list(sequences.values()), temp_fasta_query, "fasta")
+    cmd = ["blastp", "-query", temp_fasta_query, "-db", db_path, "-outfmt", "6 qseqid sseqid pident", "-max_target_seqs", "1"]
     try:
-        r49_ca_1 = h3_chains[0][49]['CA'].get_coord()
-        r49_ca_2 = h3_chains[1][49]['CA'].get_coord()
-    except KeyError:
-        print(f"Warning: H3 Arginine 49 not found in chains {h3_chains[0].id} or {h3_chains[1].id}. Skipping NCP.")
-        return None, None, None
-        
-    h3_r49_midpoint = (r49_ca_1 + r49_ca_2) / 2.0
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        for line in result.stdout.strip().split('\n'):
+            if not line: continue
+            parts = line.split()
+            chain_id, subject_id, pident = parts[0], parts[1], float(parts[2])
+            histone_type = subject_id.split('_')[0]
+            if pident > 50: histone_map[chain_id] = histone_type
+    except Exception as e:
+        print(f"BLAST error: {e}")
+        return None
+    finally:
+        if os.path.exists(temp_fasta_query): os.remove(temp_fasta_query)
+    return histone_map
 
-    # 2. Find interacting DNA chains
-    histone_atoms = [atom for chain in octamer for atom in chain.get_atoms()]
-    all_dna_residues = [res for res in structure.get_residues() if res.get_resname() in DNA_RESIDUES]
-    
+def cluster_chains_into_ncps(structure, histone_map):
+    histone_chains = {c.id: c for c in structure.get_chains() if c.id in histone_map}
+    if not histone_chains: return []
+    chain_coms = {cid: get_center_of_mass(c) for cid, c in histone_chains.items()}
+    chains_by_type = defaultdict(list)
+    for cid, h_type in histone_map.items(): chains_by_type[h_type].append(histone_chains[cid])
+    ncp_octamers, assigned_ids = [], set()
+    if not chains_by_type['H3']: return []
+    for h3 in chains_by_type['H3']:
+        if h3.id in assigned_ids: continue
+        unassigned = [(cid, com) for cid, com in chain_coms.items() if cid not in assigned_ids and cid != h3.id]
+        unassigned.sort(key=lambda x: np.linalg.norm(chain_coms[h3.id] - x[1]))
+        potential_ids = [h3.id] + [cid for cid, com in unassigned[:7]]
+        stoichiometry = defaultdict(int)
+        for cid in potential_ids: stoichiometry[histone_map[cid]] += 1
+        if all(stoichiometry.get(ht, 0) == 2 for ht in ['H2A', 'H2B', 'H3', 'H4']):
+            ncp_octamers.append([histone_chains[cid] for cid in potential_ids])
+            assigned_ids.update(potential_ids)
+    ncp_octamers.sort(key=lambda o: get_center_of_mass([a for c in o for a in c.get_atoms()])[2])
+    return ncp_octamers
+
+def find_ncp_features(octamer, histone_map, structure):
+    # 1. Find all interacting BPs for the current octamer
+    histone_atoms = [a for c in octamer for a in c.get_atoms()]
+    all_dna_residues = [r for r in structure.get_residues() if r.get_resname() in DNA_RESIDUES]
     ns = NeighborSearch(histone_atoms)
-    interacting_dna_residues = {res for res in all_dna_residues if ns.search(get_center_of_mass(res), INTERACTION_DISTANCE, level='R')}
+    interacting_dna_residues = {r for r in all_dna_residues if ns.search(get_center_of_mass(r), INTERACTION_DISTANCE, level='R')}
+    if not interacting_dna_residues: return {'error': 'No interacting DNA residues found.'}
 
-    if not interacting_dna_residues:
-        return None, None, None
+    strand_map = defaultdict(list)
+    for res in interacting_dna_residues: strand_map[res.get_parent().id].append(res)
+    if len(strand_map) < 2: return {'error': 'Could not identify two distinct DNA strands.'}
+    main_strand_ids = sorted(strand_map.keys(), key=lambda k: len(strand_map[k]), reverse=True)[:2]
+    strand1_res, strand2_res = strand_map[main_strand_ids[0]], strand_map[main_strand_ids[1]]
+    all_bps = { (r1, p) for r1 in strand1_res if (p := find_partner_for_residue(r1, strand2_res)) }
+    if not all_bps: return {'error': 'Could not form any base pairs.'}
 
-    # 3. Find the closest (pseudo) base pair to the anchor point
-    min_dist = float('inf')
-    central_bp_geometric = None
+    # 2. Define symmetry axes from global properties
+    h3_chains = [c for c in octamer if histone_map.get(c.id) == 'H3']
+    h3_coms = [get_center_of_mass(c) for c in h3_chains]
+    v_h3_h3 = h3_coms[0] - h3_coms[1]
+
+    dna_coords = np.array([get_center_of_mass(bp[0]) for bp in all_bps])
+    _, _, vh = np.linalg.svd(dna_coords - np.mean(dna_coords, axis=0))
+    v_superhelix = vh[2,:]
+
+    dyad_axis = np.cross(v_h3_h3, v_superhelix)
+    dyad_axis /= np.linalg.norm(dyad_axis)
+
+    # 3. Find the dyad BP (closest to the calculated dyad axis)
+    gho_com = get_center_of_mass(histone_atoms)
+    min_dist, dyad_bp = float('inf'), None
+    for bp in all_bps:
+        bp_com = get_center_of_mass(list(bp[0].get_atoms()) + list(bp[1].get_atoms()))
+        vec_to_bp = bp_com - gho_com
+        dist_to_axis = np.linalg.norm(vec_to_bp - np.dot(vec_to_bp, dyad_axis) * dyad_axis)
+        if dist_to_axis < min_dist:
+            min_dist, dyad_bp = dist_to_axis, bp
+    if not dyad_bp: return {'error': 'Could not find a dyad BP close to the symmetry axis.'}
+
+    # 4. Find plane-defining BPs (+/- 20 from the dyad)
+    center_res = next((r for r in dyad_bp if r.get_parent().id == main_strand_ids[0]), dyad_bp[0])
+    center_idx = center_res.id[1]
+    parent_chain = center_res.get_parent()
     
-    dna_by_chain = defaultdict(list)
-    for res in interacting_dna_residues:
-        dna_by_chain[res.get_parent().id].append(res)
-    
-    if len(dna_by_chain) < 2: return None, None, None
-    
-    main_dna_chain_ids = sorted(dna_by_chain.keys(), key=lambda k: len(dna_by_chain[k]), reverse=True)[:2]
-    strand1_res = sorted(dna_by_chain[main_dna_chain_ids[0]], key=lambda r: r.id[1])
-    strand2_res = sorted(dna_by_chain[main_dna_chain_ids[1]], key=lambda r: r.id[1])
+    # Get the full chain objects for robust partner searching
+    chain1_obj = structure[0][main_strand_ids[0]]
+    chain2_obj = structure[0][main_strand_ids[1]]
+    partner_strand_obj = chain2_obj if parent_chain.id == main_strand_ids[0] else chain1_obj
 
-    for res1 in strand1_res:
-        partner = min(strand2_res, key=lambda res2: np.linalg.norm(get_center_of_mass(res1) - get_center_of_mass(res2)))
-        bp_com = (get_center_of_mass(res1) + get_center_of_mass(partner)) / 2.0
-        dist = np.linalg.norm(bp_com - h3_r49_midpoint)
-        if dist < min_dist:
-            min_dist = dist
-            central_bp_geometric = (res1, partner)
+    plane_res_neg = next((r for r in parent_chain if r.id[1] == center_idx - 20), None)
+    plane_res_pos = next((r for r in parent_chain if r.id[1] == center_idx + 20), None)
+    if not plane_res_neg or not plane_res_pos: return {'error': 'Could not find residues +/- 20 from center.'}
 
-    if not central_bp_geometric:
-        return None, None, None
+    plane_partner_neg = find_partner_for_residue(plane_res_neg, partner_strand_obj)
+    plane_partner_pos = find_partner_for_residue(plane_res_pos, partner_strand_obj)
+    if not plane_partner_neg or not plane_partner_pos: return {'error': 'Could not find partners for plane-defining residues.'}
 
-    # 4. Find the actual Watson-Crick partners (FIX 1: search entire chain)
-    res_a, res_b = central_bp_geometric
-    full_strand1_residues = list(res_a.get_parent().get_residues())
-    full_strand2_residues = list(res_b.get_parent().get_residues())
-
-    partner_of_a = find_watson_crick_partner(res_a, full_strand2_residues)
-    partner_of_b = find_watson_crick_partner(res_b, full_strand1_residues)
-    actual_pairing_info = (res_a, partner_of_a, res_b, partner_of_b)
-
-    # 5. Define the 147bp DNA segment (reverted to user-preferred logic)
+    # 5. Define the 147bp DNA segment around the dyad
     dna_segments = []
-    for central_res in central_bp_geometric:
-        chain_id = central_res.get_parent().id
-        center_res_num = central_res.id[1]
-        start_res_num = center_res_num - 73
-        end_res_num = center_res_num + 73
-        dna_segments.append({'chain': chain_id, 'start': start_res_num, 'end': end_res_num})
-        
-    central_bp_info = [
-        {'chain': res.get_parent().id, 'resid': res.id[1]} for res in central_bp_geometric
-    ]
+    half_len = (NCP_DNA_LENGTH - 1) // 2
+    for res in dyad_bp:
+        dna_segments.append((res.get_parent().id, res.id[1] - half_len, res.id[1] + half_len))
 
-    return central_bp_info, dna_segments, actual_pairing_info
+    return {
+        'central_bp': dyad_bp,
+        'plane_bp_neg': (plane_res_neg, plane_partner_neg),
+        'plane_bp_pos': (plane_res_pos, plane_partner_pos),
+        'dna_segments': dna_segments
+    }
 
 def generate_config_file(pdb_id, ncp_octamers, histone_map, structure, output_file):
-    """Generates the final configuration file."""
     with open(output_file, 'w') as f:
         f.write(f"# NCP Configuration File for {pdb_id}\n")
-        f.write("# Generated by ncp_identification.py\n")
-        f.write("# Defines histone octamers, DNA segments, and the central base pair for symmetry axis calculation.\n\n")
-
         for i, octamer in enumerate(ncp_octamers):
-            ncp_id = i + 1
-            f.write(f"NCP: {ncp_id}\n")
-            
+            f.write(f"\nNCP: {i + 1}\n")
             histone_ids = sorted([c.id for c in octamer])
             f.write(f"HISTONE_CHAINS: {' '.join(histone_ids)}\n")
-
-            type_info = [f"{hid}({histone_map.get(hid, '?')})" for hid in histone_ids]
-            f.write(f"# Histone types: {' '.join(type_info)}\n")
-
-            # Add the machine-readable histone map
             map_items = [f"{hid}:{histone_map.get(hid, '?')}" for hid in histone_ids]
             f.write(f"HISTONE_MAP: {' '.join(map_items)}\n")
-            
-            central_bp, dna_segments, actual_pairing = find_central_bp_and_dna_segment(structure, octamer, histone_map)
-            
-            if central_bp and dna_segments:
-                bp_str = ' '.join([f"{bp['chain']}:{bp['resid']}" for bp in central_bp])
-                f.write(f"CENTRAL_BP: {bp_str}\n")
 
-                # Add detailed comment about actual pairing
-                res_a, (partner_a, dist_a, is_comp_a), res_b, (partner_b, dist_b, is_comp_b) = actual_pairing
-                
-                def get_partner_note(res, partner, dist, is_comp):
-                    res_str = f"{res.get_parent().id}:{res.id[1]}"
-                    if not partner:
-                        return f"# Note: Actual partner of {res_str} is None"
-                    
-                    partner_str = f"{partner.get_parent().id}:{partner.id[1]}"
-                    dist_str = f"{dist:.2f}"
-                    
-                    note = "complementary"
-                    if not is_comp:
-                        note = "geometric closest, MISMATCH"
-                    elif is_comp and dist > 3.5:
-                        note += ", distant"
-                        
-                    return f"# Note: Partner of {res_str} is {partner_str} (dist: {dist_str} Å, {note})"
-
-                f.write(get_partner_note(res_a, partner_a, dist_a, is_comp_a) + '\n')
-                f.write(get_partner_note(res_b, partner_b, dist_b, is_comp_b) + '\n')
-
-                for seg in dna_segments:
-                    f.write(f"DNA_SEGMENT: {seg['chain']} {seg['start']} {seg['end']}\n")
+            features = find_ncp_features(octamer, histone_map, structure)
+            if features and 'error' not in features:
+                def bp_to_str(bp): return f"{bp[0].get_parent().id}:{bp[0].id[1]} {bp[1].get_parent().id}:{bp[1].id[1]}"
+                f.write(f"CENTRAL_BP: {bp_to_str(features['central_bp'])}\n")
+                f.write(f"PLANE_BP_NEG: {bp_to_str(features['plane_bp_neg'])}\n")
+                f.write(f"PLANE_BP_POS: {bp_to_str(features['plane_bp_pos'])}\n")
+                for chain, start, end in features['dna_segments']:
+                    f.write(f"DNA_SEGMENT: {chain} {start} {end}\n")
+            elif features and 'error' in features:
+                f.write(f"# Could not identify features for this NCP. Reason: {features['error']}\n")
             else:
-                f.write("# Could not identify DNA for this NCP.\n")
-            
-            f.write("\n")
-    print(f"Configuration file generated: {output_file}")
+                f.write("# Could not identify features for this NCP for an unknown reason.\n")
 
 def main():
-    parser = argparse.ArgumentParser(description="Identify NCPs and generate a configuration file for analysis.")
+    parser = argparse.ArgumentParser(description="Identify NCPs and features for analysis.")
     parser.add_argument("pdb_file", help="Path to the input PDB file.")
-    parser.add_argument("-f", "--histone-fasta", required=True, help="Path to FASTA file of canonical histone sequences (for BLAST db).")
-    parser.add_argument("-o", "--output-config", default=None, help="Name of the output configuration file. Defaults to <pdb_filename>_config.txt")
+    parser.add_argument("--histone-fasta", required=True, help="Path to FASTA file of canonical histone sequences.")
+    parser.add_argument("--output-config", default=None, help="Output config file. Defaults to <pdb_filename>_config.txt")
     args = parser.parse_args()
 
-    if not os.path.exists(args.pdb_file):
-        print(f"Error: PDB file not found at {args.pdb_file}"); return
-    if not os.path.exists(args.histone_fasta):
-        print(f"Error: Histone FASTA file not found at {args.histone_fasta}"); return
+    if not os.path.exists(args.pdb_file): return print(f"Error: PDB file not found: {args.pdb_file}")
+    if not os.path.exists(args.histone_fasta): return print(f"Error: FASTA file not found: {args.histone_fasta}")
 
     pdb_id = os.path.splitext(os.path.basename(args.pdb_file))[0]
     db_path = os.path.splitext(args.histone_fasta)[0]
-
-    # Determine output config file name
     output_config = args.output_config if args.output_config else f"{pdb_id}_config.txt"
 
-    # 1. Create BLAST database if it doesn't exist
     if not os.path.exists(f"{db_path}.phr"):
         print(f"Creating BLAST database from {args.histone_fasta}...")
-        cmd_makedb = ["makeblastdb", "-in", args.histone_fasta, "-dbtype", "prot", "-out", db_path, "-parse_seqids"]
         try:
-            subprocess.run(cmd_makedb, check=True, capture_output=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            print(f"Error creating BLAST database: {e}")
-            print("Please ensure NCBI BLAST+ is installed and in your system's PATH.")
-            return
+            subprocess.run(["makeblastdb", "-in", args.histone_fasta, "-dbtype", "prot", "-out", db_path, "-parse_seqids"], check=True, capture_output=True)
+        except Exception as e: return print(f"Error creating BLAST db: {e}")
 
-    # 2. Load Structure and Identify Histones
     print(f"Loading structure from {args.pdb_file}...")
-    parser = PDBParser()
-    structure = parser.get_structure(pdb_id, args.pdb_file)
+    structure = PDBParser().get_structure(pdb_id, args.pdb_file)
     
-    print("Extracting chain sequences...")
+    print("Identifying histones...")
     sequences = get_chain_sequences(structure)
-    
-    print("Identifying histones via BLAST...")
     histone_map = identify_histones_by_blast(sequences, db_path)
-    if not histone_map:
-        print("Could not identify any histones. Aborting."); return
-    print(f"Identified {len(histone_map)} histone chains.")
+    if not histone_map: return print("Could not identify any histones.")
 
-    # 3. Cluster NCPs
-    print("Clustering chains into histone octamers...")
+    print("Clustering histone octamers...")
     ncp_octamers = cluster_chains_into_ncps(structure, histone_map)
-    if not ncp_octamers:
-        print("Could not cluster any complete histone octamers. Aborting."); return
-    print(f"Found {len(ncp_octamers)} NCP(s).")
+    if not ncp_octamers: return print("Could not cluster any histone octamers.")
 
-    # 4. Generate Configuration File
-    print("Identifying central base pairs and DNA segments...")
+    print(f"Identifying features and writing config file...")
     generate_config_file(pdb_id, ncp_octamers, histone_map, structure, output_config)
-    print("\nIdentification complete.")
-
+    print(f"\nIdentification complete. Config written to {output_config}")
 
 if __name__ == "__main__":
     main()

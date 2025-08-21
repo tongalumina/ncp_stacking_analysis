@@ -75,8 +75,8 @@ def calculate_ncp_basis(ncp_def, all_chains_map, histone_map):
     try:
         histone_chains = [all_chains_map[cid] for cid in ncp_def['histone_chains']]
         central_bp_residues = [all_chains_map[bp[0]][bp[1]] for bp in ncp_def['central_bp']]
-        plane_bp_neg_residues = [all_chains_map[bp[0]][bp[1]] for bp in ncp_def['plane_bp_neg']]
-        plane_bp_pos_residues = [all_chains_map[bp[0]][bp[1]] for bp in ncp_def['plane_bp_pos']]
+        dna_segments = ncp_def['dna_segments']
+        dna_residues = [res for seg in dna_segments for res in all_chains_map.get(seg[0], []) if int(seg[1]) <= res.id[1] <= int(seg[2])]
     except KeyError as e:
         print(f"DIAGNOSTIC: Skipping NCP {ncp_def['id']}. Reason: A chain or residue from config not in PDB. Missing key: {e}")
         return None
@@ -94,18 +94,19 @@ def calculate_ncp_basis(ncp_def, all_chains_map, histone_map):
     symmetry_axis = central_dna_com - gho_com
     symmetry_axis /= np.linalg.norm(symmetry_axis)
 
-    com_bp_neg = get_center_of_mass([a for r in plane_bp_neg_residues for a in r if a.element != 'H'])
-    com_bp_pos = get_center_of_mass([a for r in plane_bp_pos_residues for a in r if a.element != 'H'])
-    if com_bp_neg is None or com_bp_pos is None: 
-        print(f"DIAGNOSTIC: Skipping NCP {ncp_def['id']}. No plane BP COM.")
+    plane_defining_atoms = [res['P'] for res in dna_residues if 'P' in res]
+    if len(plane_defining_atoms) < 3:
+        print(f"DIAGNOSTIC: Skipping NCP {ncp_def['id']}. Not enough phosphate atoms to define plane.")
         return None
-
-    vec_neg = np.cross(symmetry_axis, com_bp_neg - gho_com)
-    vec_pos = np.cross(symmetry_axis, com_bp_pos - gho_com)
-    plane_normal = vec_neg + vec_pos
+    
+    plane_coords = [atom.get_coord() for atom in plane_defining_atoms]
+    centroid = np.mean(plane_coords, axis=0)
+    _, _, vh = np.linalg.svd(plane_coords - centroid)
+    plane_normal = vh[2, :]
     plane_normal /= np.linalg.norm(plane_normal)
 
-    if np.dot(symmetry_axis, plane_normal) < 0: plane_normal *= -1
+    if np.dot(symmetry_axis, plane_normal) < 0:
+        plane_normal *= -1
 
     return {"com": gho_com, "axis": symmetry_axis, "normal": plane_normal}
 
@@ -161,11 +162,10 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
 
     script_lines = []
     script_lines.append(f"load {stack_pdb_file}, main_obj")
-    script_lines.extend(["bg_color white", "hide everything", "show cartoon", "util.cbc"])
+    script_lines.extend(["bg_color white", "hide everything", "show cartoon", "util.cbc", "set cartoon_transparency, 0.2"])
 
     colors = ["palecyan", "lightorange", "lightmagenta", "palegreen"]
     
-    # 1. Create selections for each NCP with precise residue ranges
     for i, ncp_def in enumerate(ncp_configs):
         ncp_name = f"ncp{ncp_def['id']}"
         color = colors[i % len(colors)]
@@ -174,7 +174,6 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
         script_lines.append(f"select {ncp_name}, {' or '.join(h_selectors + d_selectors)}")
         script_lines.append(f"color {color}, {ncp_name}")
 
-    # 2. Identify and color overlapping DNA regions
     if len(ncp_configs) > 1:
         for i in range(len(ncp_configs) - 1):
             ncp1_segs = ncp_configs[i]['dna_segments']
@@ -190,7 +189,6 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
                             script_lines.append(f"color hotpink, {sel_name}")
                             script_lines.append(f"show sticks, {sel_name}")
 
-    # 3. Draw basis vectors and planes
     for i, ncp in enumerate(ncp_bases):
         ncp_id = ncp['id']
         com, axis, normal = ncp['com'], ncp['axis'], ncp['normal']
@@ -209,29 +207,31 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
         disk_cgo.append("END")
         script_lines.append(f"load_cgo([ { ', '.join(disk_cgo)} ], plane{ncp_id}, 1)")
 
-    # 4. Draw stacking parameters and labels
     if all_params:
-        params = all_params[0]
-        ncp1, ncp2 = ncp_bases[0], ncp_bases[1]
-        c1, c2 = ncp1['com'], ncp2['com']
-        script_lines.append(f"cgo_arrow {format_vec(c1)}, {format_vec(c2)}, radius=0.3, color=black, name=dist_vec")
-        
-        label_pos = (c1 + c2) / 2.0
-        y_offset = 0
-        script_lines.append(f'# --- Stacking Parameter Labels ---')
-        for key, value in params.items():
-            unit = " A" if key in ["Distance", "Rise", "Shift"] else " deg"
-            label_text = f'{key}: {value:.1f}{unit}'
-            label_name = f"label_{key.replace(' ','_')}"
-            script_lines.append(f'pseudoatom {label_name}, pos={format_vec(label_pos + np.array([40, y_offset, 0]))}')
-            script_lines.append(f'label {label_name}, "{label_text}"')
+        for i, params in enumerate(all_params):
+            ncp1, ncp2 = ncp_bases[i], ncp_bases[i+1]
+            c1, c2 = ncp1['com'], ncp2['com']
+            script_lines.append(f"cgo_arrow {format_vec(c1)}, {format_vec(c2)}, radius=0.3, color=black, name=dist_vec_{i+1}_{i+2}")
+            label_pos = (c1 + c2) / 2.0
+            y_offset = i * -60
+            x_offset = 40
+            title_name = f"label_title_{i+1}_{i+2}"
+            script_lines.append(f'pseudoatom {title_name}, pos={format_vec(label_pos + np.array([x_offset, y_offset, 0]))}')
+            script_lines.append(f'label {title_name}, "NCP {ncp1["id"]}-NCP {ncp2["id"]} Stack" ')
             y_offset -= 8
-        script_lines.extend(["set label_color, black, label_*", "set label_size, 20", "set label_font_id, 7"])
+            for key, value in params.items():
+                unit = " A" if key in ["Distance", "Rise", "Shift"] else " deg"
+                label_text = f'{key}: {value:.1f}{unit}'
+                label_name = f"label_{i+1}_{i+2}_{key.replace(' ','_')}"
+                script_lines.append(f'pseudoatom {label_name}, pos={format_vec(label_pos + np.array([x_offset, y_offset, 0]))}')
+                script_lines.append(f'label {label_name}, "{label_text}"')
+                y_offset -= 6
 
-    script_lines.append("hide labels, com*")
-    script_lines.append("group basis_vectors, com* axis* normal* plane*")
-    script_lines.append("group labels, label_*")
-    script_lines.append("zoom visible")
+    script_lines.extend([
+        "set label_color, black, label_*", "set label_size, 16", "set label_font_id, 7",
+        "hide labels, com*", "group basis_vectors, com* axis* normal* plane*",
+        "group labels, label_*", "group stacking_vectors, dist_vec_*", "zoom visible"
+    ])
 
     with open(pml_file, 'w') as f:
         f.write("\n".join(script_lines))
@@ -266,7 +266,6 @@ def main():
 
     if len(ncp_bases) < 2:
         print("Analysis requires at least two valid NCPs. Aborting.")
-        # Still generate a pml script for the single NCP if it exists
         if len(ncp_bases) == 1:
             generate_pymol_script(output_prefix, ncps_config, ncp_bases, [], histone_map)
         return
@@ -297,4 +296,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

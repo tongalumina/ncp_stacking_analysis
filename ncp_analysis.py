@@ -91,8 +91,24 @@ def calculate_ncp_basis(ncp_def, all_chains_map, histone_map):
     if central_dna_com is None: 
         print(f"DIAGNOSTIC: Skipping NCP {ncp_def['id']}. No central BP COM.")
         return None
-    symmetry_axis = central_dna_com - gho_com
+    
+    # Calculate both approaches for dyad axis
+    h3_chains = [c for c in histone_chains if histone_map.get(c.id) == 'H3']
+    h3_coms = [get_center_of_mass([a for a in c.get_atoms()]) for c in h3_chains]
+    v_h3_h3 = h3_coms[0] - h3_coms[1]
+    
+    dna_coords = np.array([get_center_of_mass([a for a in res.get_atoms() if a.element != 'H']) for res in dna_residues])
+    _, _, vh = np.linalg.svd(dna_coords - np.mean(dna_coords, axis=0))
+    v_superhelix = vh[2,:]
+    
+    # Cross product dyad axis
+    symmetry_axis = np.cross(v_h3_h3, v_superhelix)
     symmetry_axis /= np.linalg.norm(symmetry_axis)
+    
+    # Normalize to point toward central dyad BP
+    reference_direction = central_dna_com - gho_com
+    if np.dot(symmetry_axis, reference_direction) < 0:
+        symmetry_axis *= -1
 
     plane_defining_atoms = [res['P'] for res in dna_residues if 'P' in res]
     if len(plane_defining_atoms) < 3:
@@ -173,6 +189,12 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
         d_selectors = [f"(chain {seg[0]} and resi {int(seg[1])}-{int(seg[2])})" for seg in ncp_def['dna_segments']]
         script_lines.append(f"select {ncp_name}, {' or '.join(h_selectors + d_selectors)}")
         script_lines.append(f"color {color}, {ncp_name}")
+        
+        # Add H3 pair selection for each NCP
+        h3_chains = [c for c in ncp_def['histone_chains'] if histone_map.get(c) == 'H3']
+        if len(h3_chains) >= 2:
+            h3_selector = f"(chain {h3_chains[0]} and resi {HISTONE_CORE_RANGES['H3'][0]}-{HISTONE_CORE_RANGES['H3'][1]}) or (chain {h3_chains[1]} and resi {HISTONE_CORE_RANGES['H3'][0]}-{HISTONE_CORE_RANGES['H3'][1]})"
+            script_lines.append(f"select h3_pair_{ncp_def['id']}, {h3_selector}")
 
     if len(ncp_configs) > 1:
         for i in range(len(ncp_configs) - 1):
@@ -212,25 +234,35 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
             ncp1, ncp2 = ncp_bases[i], ncp_bases[i+1]
             c1, c2 = ncp1['com'], ncp2['com']
             script_lines.append(f"cgo_arrow {format_vec(c1)}, {format_vec(c2)}, radius=0.3, color=black, name=dist_vec_{i+1}_{i+2}")
-            label_pos = (c1 + c2) / 2.0
-            y_offset = i * -60
-            x_offset = 40
+            
+            # Fixed label positioning: place along the line connecting the two NCPs
+            line_vector = c2 - c1
+            line_midpoint = (c1 + c2) / 2.0
+            # Position labels perpendicular to the line
+            perpendicular_offset = np.array([0, 40, 0])  # Base offset
+            if np.abs(line_vector[1]) > 0.1:  # If line is not horizontal, adjust offset
+                perpendicular_offset = np.array([40, 0, 0])
+            
+            label_base_pos = line_midpoint + perpendicular_offset + np.array([0, i * -30, 0])
+            
             title_name = f"label_title_{i+1}_{i+2}"
-            script_lines.append(f'pseudoatom {title_name}, pos={format_vec(label_pos + np.array([x_offset, y_offset, 0]))}')
+            script_lines.append(f'pseudoatom {title_name}, pos={format_vec(label_base_pos)}')
             script_lines.append(f'label {title_name}, "NCP {ncp1["id"]}-NCP {ncp2["id"]} Stack" ')
-            y_offset -= 8
+            
+            y_offset = -8
             for key, value in params.items():
                 unit = " A" if key in ["Distance", "Rise", "Shift"] else " deg"
                 label_text = f'{key}: {value:.1f}{unit}'
                 label_name = f"label_{i+1}_{i+2}_{key.replace(' ','_')}"
-                script_lines.append(f'pseudoatom {label_name}, pos={format_vec(label_pos + np.array([x_offset, y_offset, 0]))}')
+                label_pos = label_base_pos + np.array([0, y_offset, 0])
+                script_lines.append(f'pseudoatom {label_name}, pos={format_vec(label_pos)}')
                 script_lines.append(f'label {label_name}, "{label_text}"')
                 y_offset -= 6
 
     script_lines.extend([
         "set label_color, black, label_*", "set label_size, 16", "set label_font_id, 7",
         "hide labels, com*", "group basis_vectors, com* axis* normal* plane*",
-        "group labels, label_*", "group stacking_vectors, dist_vec_*", "zoom visible"
+        "group h3_pairs, h3_pair_*", "group labels, label_*", "group stacking_vectors, dist_vec_*", "zoom visible"
     ])
 
     with open(pml_file, 'w') as f:

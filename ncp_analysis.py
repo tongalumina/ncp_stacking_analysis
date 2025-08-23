@@ -75,6 +75,8 @@ def calculate_ncp_basis(ncp_def, all_chains_map, histone_map):
     try:
         histone_chains = [all_chains_map[cid] for cid in ncp_def['histone_chains']]
         central_bp_residues = [all_chains_map[bp[0]][bp[1]] for bp in ncp_def['central_bp']]
+        plane_bp_neg_residues = [all_chains_map[bp[0]][bp[1]] for bp in ncp_def['plane_bp_neg']]
+        plane_bp_pos_residues = [all_chains_map[bp[0]][bp[1]] for bp in ncp_def['plane_bp_pos']]
         dna_segments = ncp_def['dna_segments']
         dna_residues = [res for seg in dna_segments for res in all_chains_map.get(seg[0], []) if int(seg[1]) <= res.id[1] <= int(seg[2])]
     except KeyError as e:
@@ -98,8 +100,8 @@ def calculate_ncp_basis(ncp_def, all_chains_map, histone_map):
     v_h3_h3 = h3_coms[0] - h3_coms[1]
     
     dna_coords = np.array([get_center_of_mass([a for a in res.get_atoms() if a.element != 'H']) for res in dna_residues])
-    _, _, vh = np.linalg.svd(dna_coords - np.mean(dna_coords, axis=0))
-    v_superhelix = vh[2,:]
+    _, _, vh_dna = np.linalg.svd(dna_coords - np.mean(dna_coords, axis=0))
+    v_superhelix = vh_dna[2,:]
     
     # Cross product dyad axis
     symmetry_axis = np.cross(v_h3_h3, v_superhelix)
@@ -110,21 +112,54 @@ def calculate_ncp_basis(ncp_def, all_chains_map, histone_map):
     if np.dot(symmetry_axis, reference_direction) < 0:
         symmetry_axis *= -1
 
-    plane_defining_atoms = [res['P'] for res in dna_residues if 'P' in res]
+    # Filter the DNA residues to get only the central 129 base pairs for plane definition
+    bp1_chain, bp1_resid = ncp_def['central_bp'][0]
+    bp2_chain, bp2_resid = ncp_def['central_bp'][1]
+    
+    # Define the residue ID ranges for the 129bp segment on each strand
+    range1_start, range1_end = bp1_resid - 64, bp1_resid + 64
+    range2_start, range2_end = bp2_resid - 64, bp2_resid + 64
+    
+    central_129_residues = []
+    for res in dna_residues:
+        res_chain = res.get_parent().id
+        res_id = res.id[1]
+        # Check if the residue falls within the 129bp range on either strand
+        if (res_chain == bp1_chain and range1_start <= res_id <= range1_end) or \
+           (res_chain == bp2_chain and range2_start <= res_id <= range2_end):
+            central_129_residues.append(res)
+
+    plane_defining_atoms = [res['P'] for res in central_129_residues if 'P' in res]
     if len(plane_defining_atoms) < 3:
-        print(f"DIAGNOSTIC: Skipping NCP {ncp_def['id']}. Not enough phosphate atoms to define plane.")
+        print(f"DIAGNOSTIC: Skipping NCP {ncp_def['id']}. Not enough phosphate atoms in central 129bp to define plane.")
         return None
     
     plane_coords = [atom.get_coord() for atom in plane_defining_atoms]
     centroid = np.mean(plane_coords, axis=0)
-    _, _, vh = np.linalg.svd(plane_coords - centroid)
-    plane_normal = vh[2, :]
+    _, _, vh_plane = np.linalg.svd(plane_coords - centroid)
+    plane_normal = vh_plane[2, :]
     plane_normal /= np.linalg.norm(plane_normal)
 
-    if np.dot(symmetry_axis, plane_normal) < 0:
+    # --- New Normalization Logic ---
+    # Use the ordered BPs to determine the DNA writhe direction
+    p_neg = get_center_of_mass([a for r in plane_bp_neg_residues for a in r if a.element != 'H'])
+    p_pos = get_center_of_mass([a for r in plane_bp_pos_residues for a in r if a.element != 'H'])
+    
+    if p_neg is None or p_pos is None or central_dna_com is None:
+        print(f"DIAGNOSTIC: Skipping NCP {ncp_def['id']}. Could not find COM for all plane-defining BPs.")
+        return None
+
+    # Define the superhelix vector based on the DNA path
+    v1 = central_dna_com - p_neg
+    v2 = p_pos - central_dna_com
+    superhelix_vector = np.cross(v1, v2)
+    
+    # Normalize the plane_normal to point in the same direction as the superhelix vector
+    if np.dot(plane_normal, superhelix_vector) < 0:
         plane_normal *= -1
 
     return {"com": gho_com, "axis": symmetry_axis, "normal": plane_normal}
+
 
 def calculate_stacking_parameters(basis1, basis2):
     c1, ax1, n1 = basis1["com"], basis1["axis"], basis1["normal"]
@@ -161,7 +196,8 @@ def calculate_stacking_parameters(basis1, basis2):
     proj_n2_on_plane1 = n2 - np.dot(n2, n1) * n1
     proj_n2_norm = np.linalg.norm(proj_n2_on_plane1)
     if proj_n2_norm > 1e-6:
-        unit_proj_n2 = proj_n2_on_plane1 / proj_n2_norm
+        # Invert the projection vector to match the paper's convention for tilt direction
+        unit_proj_n2 = -proj_n2_on_plane1 / proj_n2_norm
         cos_tilt_dir = np.clip(np.dot(unit_proj_n2, ref_vec), -1.0, 1.0)
         angle_tilt_dir = np.rad2deg(np.arccos(cos_tilt_dir))
         sign_tilt_dir = np.sign(np.dot(np.cross(ref_vec, unit_proj_n2), n1))

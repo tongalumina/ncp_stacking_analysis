@@ -115,7 +115,7 @@ def cluster_chains_into_ncps(structure, histone_map):
             ncp_octamers.append(octamer_atoms)
             assigned_ids.update(potential_ids)
             
-    ncp_octamers.sort(key=lambda o: get_center_of_mass(o)[2])
+    # Sorting is now handled in generate_config_file
     return ncp_octamers
 
 def find_ncp_features(octamer_atoms, histone_map, full_structure, args):
@@ -184,19 +184,38 @@ def find_ncp_features(octamer_atoms, histone_map, full_structure, args):
     dyad_res2_atoms = interacting_dna[(interacting_dna.res_id == dyad_bp_indices[1])]
     logging.info(f"Identified dyad BP: {dyad_res1_atoms[0].chain_id}:{dyad_res1_atoms[0].res_id} - {dyad_res2_atoms[0].chain_id}:{dyad_res2_atoms[0].res_id}")
 
-    # Sort base pairs sequentially to define the segment for plane finding
-    # A simple sort by the residue ID of the first atom in each pair is sufficient
-    sorted_bps = sorted(base_pairs, key=lambda bp: interacting_dna.res_id[bp[0]])
+    # --- New plane-defining BP logic ---
+    all_bps = struc.base_pairs(dna_structure)
+    bp_partner_map = {}
+    for i, j in all_bps:
+        res1_info = (dna_structure.chain_id[i], dna_structure.res_id[i])
+        res2_info = (dna_structure.chain_id[j], dna_structure.res_id[j])
+        bp_partner_map[res1_info] = res2_info
+        bp_partner_map[res2_info] = res1_info
 
-    plane_bp_neg_indices = sorted_bps[len(sorted_bps) // 4]
-    plane_bp_pos_indices = sorted_bps[3 * len(sorted_bps) // 4]
+    dyad_res1_info = (dyad_res1_atoms[0].chain_id, dyad_res1_atoms[0].res_id)
+    
+    plane_neg_res_id = dyad_res1_info[1] - 20
+    plane_pos_res_id = dyad_res1_info[1] + 20
+    
+    plane_neg_res1_info = (dyad_res1_info[0], plane_neg_res_id)
+    plane_pos_res1_info = (dyad_res1_info[0], plane_pos_res_id)
 
-    plane_res_neg1 = interacting_dna[plane_bp_neg_indices[0]]
-    plane_res_neg2 = interacting_dna[plane_bp_neg_indices[1]]
-    plane_res_pos1 = interacting_dna[plane_bp_pos_indices[0]]
-    plane_res_pos2 = interacting_dna[plane_bp_pos_indices[1]]
+    plane_neg_res2_info = bp_partner_map.get(plane_neg_res1_info)
+    plane_pos_res2_info = bp_partner_map.get(plane_pos_res1_info)
 
-    logging.info("Successfully found plane-defining residues.")
+    if not plane_neg_res2_info or not plane_pos_res2_info:
+        return {'error': f'Could not find plane-defining base pairs at dyad +/- 20 bp. Missing partners for {plane_neg_res1_info} or {plane_pos_res1_info}'}
+
+    plane_res_neg1_atoms = dna_structure[(dna_structure.chain_id == plane_neg_res1_info[0]) & (dna_structure.res_id == plane_neg_res1_info[1])]
+    plane_res_neg2_atoms = dna_structure[(dna_structure.chain_id == plane_neg_res2_info[0]) & (dna_structure.res_id == plane_neg_res2_info[1])]
+    plane_res_pos1_atoms = dna_structure[(dna_structure.chain_id == plane_pos_res1_info[0]) & (dna_structure.res_id == plane_pos_res1_info[1])]
+    plane_res_pos2_atoms = dna_structure[(dna_structure.chain_id == plane_pos_res2_info[0]) & (dna_structure.res_id == plane_pos_res2_info[1])]
+
+    if any(a.array_length() == 0 for a in [plane_res_neg1_atoms, plane_res_neg2_atoms, plane_res_pos1_atoms, plane_res_pos2_atoms]):
+        return {'error': 'Could not find all atom records for plane-defining base pairs at dyad +/- 20 bp.'}
+
+    logging.info("Successfully found plane-defining residues at dyad +/- 20.")
 
     dna_segments = []
     half_len = (NCP_DNA_LENGTH - 1) // 2
@@ -205,23 +224,44 @@ def find_ncp_features(octamer_atoms, histone_map, full_structure, args):
 
     return {
         'central_bp': (dyad_res1_atoms[0], dyad_res2_atoms[0]),
-        'plane_bp_neg': (plane_res_neg1, plane_res_neg2),
-        'plane_bp_pos': (plane_res_pos1, plane_res_pos2),
+        'plane_bp_neg': (plane_res_neg1_atoms[0], plane_res_neg2_atoms[0]),
+        'plane_bp_pos': (plane_res_pos1_atoms[0], plane_res_pos2_atoms[0]),
         'dna_segments': dna_segments,
     }
 
 def generate_config_file(pdb_id, ncp_octamers, histone_map, structure, output_file, args):
+    
+    ncp_data = []
+    for octamer_atoms in ncp_octamers:
+        features = find_ncp_features(octamer_atoms, histone_map, structure, args)
+        if features and 'error' not in features:
+            res1, res2 = features['central_bp']
+            # Sort key is the minimum of the two (chain_id, res_id) tuples from the central BP
+            sort_key = min((res1.chain_id, res1.res_id), (res2.chain_id, res2.res_id))
+            ncp_data.append({'sort_key': sort_key, 'octamer': octamer_atoms, 'features': features})
+        else:
+            # Handle cases where features could not be identified
+            # Give it a sort key that places it at the end
+            ncp_data.append({'sort_key': ('~', float('inf')), 'octamer': octamer_atoms, 'features': features})
+
+    # Sort NCPs based on the defined key
+    ncp_data.sort(key=lambda x: x['sort_key'])
+
     with open(output_file, 'w') as f:
         f.write(f"# NCP Configuration File for {pdb_id}\n")
         f.write(f"# Generated using biotite for base-pair analysis.\n")
-        for i, octamer_atoms in enumerate(ncp_octamers):
+        f.write(f"# NCPs are sorted by their position on the DNA strand.\n")
+        
+        for i, data in enumerate(ncp_data):
+            octamer_atoms = data['octamer']
+            features = data['features']
+            
             f.write(f"\nNCP: {i + 1}\n")
             histone_ids = sorted(np.unique(octamer_atoms.chain_id))
             f.write(f"HISTONE_CHAINS: {' '.join(histone_ids)}\n")
             map_items = [f"{hid}:{histone_map.get(hid, '?')}" for hid in histone_ids]
             f.write(f"HISTONE_MAP: {' '.join(map_items)}\n")
 
-            features = find_ncp_features(octamer_atoms, histone_map, structure, args)
             if features and 'error' not in features:
                 def res_to_str(res): return f"{res.chain_id}:{res.res_id}"
                 f.write(f"CENTRAL_BP: {res_to_str(features['central_bp'][0])} {res_to_str(features['central_bp'][1])}\n")
@@ -233,6 +273,7 @@ def generate_config_file(pdb_id, ncp_octamers, histone_map, structure, output_fi
                 f.write(f"# Could not identify features for this NCP. Reason: {features['error']}\n")
             else:
                 f.write("# Could not identify features for this NCP for an unknown reason.\n")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Identify NCPs and features for analysis using biotite.")

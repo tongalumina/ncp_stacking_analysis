@@ -12,12 +12,15 @@ import subprocess
 import numpy as np
 import biotite.structure as struc
 import biotite.structure.io as strucio
+from biotite.structure.io.pdb import PDBFile
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from Bio import SeqIO
 from collections import defaultdict
 import warnings
 import logging
+
+warnings.filterwarnings("ignore", message=".*has less than 3 base atoms.*")
 
 # --- Constants ---
 DNA_RESIDUES = ['DA', 'DC', 'DG', 'DT']
@@ -143,7 +146,7 @@ def find_ncp_features(octamer_atoms, histone_map, full_structure, args):
         return {'error': 'biotite found no canonical base pairs in the interacting DNA.'}
     logging.info(f"biotite found {base_pairs.shape[0]} base pairs.")
 
-    dyad_bp_indices = None
+    dyad_bp_info = None
     h3_chains = [octamer_atoms[octamer_atoms.chain_id == cid] for cid in octamer_chain_ids if histone_map[cid] == 'H3']
     logging.info(f"H3 chains for dyad calculation: {[c.chain_id[0] for c in h3_chains]}")
 
@@ -155,7 +158,6 @@ def find_ncp_features(octamer_atoms, histone_map, full_structure, args):
         logging.info(f"Using H3 residue 116 restraint. Midpoint at: {r116_midpoint}")
         
         min_dist = float('inf')
-        dyad_bp_res_ids = None
         for bp_indices in base_pairs:
             res1_id = interacting_dna.res_id[bp_indices[0]]
             res1_chain_id = interacting_dna.chain_id[bp_indices[0]]
@@ -171,17 +173,28 @@ def find_ncp_features(octamer_atoms, histone_map, full_structure, args):
             dist = np.linalg.norm(com - r116_midpoint)
             if dist < min_dist:
                 min_dist = dist
-                dyad_bp_indices = (res1_id, res2_id)
+                dyad_bp_info = {
+                    'res1': {'chain_id': res1_chain_id, 'res_id': res1_id},
+                    'res2': {'chain_id': res2_chain_id, 'res_id': res2_id}
+                }
     else:
         missing_chains = [c.chain_id[0] for c in h3_chains if c[c.res_id == 116].array_length() == 0]
         logging.warning(f"Could not find H3 residue 116 in H3 chain(s): {missing_chains}. Falling back to geometric method.")
         middle_bp_indices = base_pairs[len(base_pairs) // 2]
         res1_id = interacting_dna.res_id[middle_bp_indices[0]]
+        res1_chain_id = interacting_dna.chain_id[middle_bp_indices[0]]
         res2_id = interacting_dna.res_id[middle_bp_indices[1]]
-        dyad_bp_indices = (res1_id, res2_id)
+        res2_chain_id = interacting_dna.chain_id[middle_bp_indices[1]]
+        dyad_bp_info = {
+            'res1': {'chain_id': res1_chain_id, 'res_id': res1_id},
+            'res2': {'chain_id': res2_chain_id, 'res_id': res2_id}
+        }
 
-    dyad_res1_atoms = interacting_dna[(interacting_dna.res_id == dyad_bp_indices[0])]
-    dyad_res2_atoms = interacting_dna[(interacting_dna.res_id == dyad_bp_indices[1])]
+    if dyad_bp_info is None:
+        return {'error': 'Could not identify a dyad base pair.'}
+
+    dyad_res1_atoms = interacting_dna[(interacting_dna.chain_id == dyad_bp_info['res1']['chain_id']) & (interacting_dna.res_id == dyad_bp_info['res1']['res_id'])]
+    dyad_res2_atoms = interacting_dna[(interacting_dna.chain_id == dyad_bp_info['res2']['chain_id']) & (interacting_dna.res_id == dyad_bp_info['res2']['res_id'])]
     logging.info(f"Identified dyad BP: {dyad_res1_atoms[0].chain_id}:{dyad_res1_atoms[0].res_id} - {dyad_res2_atoms[0].chain_id}:{dyad_res2_atoms[0].res_id}")
 
     # --- New plane-defining BP logic ---
@@ -193,19 +206,46 @@ def find_ncp_features(octamer_atoms, histone_map, full_structure, args):
         bp_partner_map[res1_info] = res2_info
         bp_partner_map[res2_info] = res1_info
 
-    dyad_res1_info = (dyad_res1_atoms[0].chain_id, dyad_res1_atoms[0].res_id)
-    
-    plane_neg_res_id = dyad_res1_info[1] - 20
-    plane_pos_res_id = dyad_res1_info[1] + 20
-    
-    plane_neg_res1_info = (dyad_res1_info[0], plane_neg_res_id)
-    plane_pos_res1_info = (dyad_res1_info[0], plane_pos_res_id)
+    def find_closest_bp(ref_chain, target_resid, window_size, bp_map):
+        best_residue_info = None
+        min_dist = float('inf')
+        for offset in range(-window_size, window_size + 1):
+            current_resid = target_resid + offset
+            current_res_info = (ref_chain, current_resid)
+            if current_res_info in bp_map:
+                dist = abs(offset)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_residue_info = current_res_info
+        if best_residue_info:
+            return best_residue_info, bp_map[best_residue_info]
+        else:
+            return None, None
 
-    plane_neg_res2_info = bp_partner_map.get(plane_neg_res1_info)
-    plane_pos_res2_info = bp_partner_map.get(plane_pos_res1_info)
+    dyad_refs = [
+        (dyad_res1_atoms[0].chain_id, dyad_res1_atoms[0].res_id),
+        (dyad_res2_atoms[0].chain_id, dyad_res2_atoms[0].res_id)
+    ]
+    
+    plane_bp_found = False
+    last_error_info = ""
+    search_window = 5 # Search +/- 5 residues around the target
 
-    if not plane_neg_res2_info or not plane_pos_res2_info:
-        return {'error': f'Could not find plane-defining base pairs at dyad +/- 20 bp. Missing partners for {plane_neg_res1_info} or {plane_pos_res1_info}'}
+    for ref_chain, ref_resid in dyad_refs:
+        target_neg_id = ref_resid - 20
+        target_pos_id = ref_resid + 20
+        
+        plane_neg_res1_info, plane_neg_res2_info = find_closest_bp(ref_chain, target_neg_id, search_window, bp_partner_map)
+        plane_pos_res1_info, plane_pos_res2_info = find_closest_bp(ref_chain, target_pos_id, search_window, bp_partner_map)
+
+        if plane_neg_res1_info and plane_pos_res1_info:
+            plane_bp_found = True
+            break 
+        else:
+            last_error_info = f"Could not find valid BPs near {ref_chain}:{target_neg_id} or {ref_chain}:{target_pos_id}"
+    
+    if not plane_bp_found:
+        return {'error': f'Could not find plane-defining base pairs. {last_error_info}'}
 
     plane_res_neg1_atoms = dna_structure[(dna_structure.chain_id == plane_neg_res1_info[0]) & (dna_structure.res_id == plane_neg_res1_info[1])]
     plane_res_neg2_atoms = dna_structure[(dna_structure.chain_id == plane_neg_res2_info[0]) & (dna_structure.res_id == plane_neg_res2_info[1])]
@@ -215,7 +255,7 @@ def find_ncp_features(octamer_atoms, histone_map, full_structure, args):
     if any(a.array_length() == 0 for a in [plane_res_neg1_atoms, plane_res_neg2_atoms, plane_res_pos1_atoms, plane_res_pos2_atoms]):
         return {'error': 'Could not find all atom records for plane-defining base pairs at dyad +/- 20 bp.'}
 
-    logging.info("Successfully found plane-defining residues at dyad +/- 20.")
+    logging.info("Successfully found plane-defining residues.")
 
     dna_segments = []
     half_len = (NCP_DNA_LENGTH - 1) // 2
@@ -303,7 +343,6 @@ def main():
 
     db_path = os.path.splitext(args.histone_fasta)[0]
     output_config = args.output_config if args.output_config else f"{pdb_id}_config.txt"
-    output_config = args.output_config if args.output_config else f"{pdb_id}_config.txt"
 
     if not os.path.exists(f"{db_path}.phr"):
         logging.info(f"Creating BLAST database from {args.histone_fasta}...")
@@ -315,7 +354,10 @@ def main():
 
     logging.info(f"Loading structure with biotite from {args.pdb_file}...")
     try:
-        structure = strucio.load_structure(args.pdb_file)
+        # Explicitly use the PDB file parser to avoid issues with non-standard extensions
+        pdb_f = PDBFile.read(args.pdb_file)
+        # Get only the first model to handle multi-model PDBs
+        structure = pdb_f.get_structure(model=1)
     except Exception as e:
         logging.error(f"Could not load structure with biotite: {e}")
         return print(f"Error: Could not load PDB file with biotite.")

@@ -41,7 +41,7 @@ import os
 import subprocess
 import numpy as np
 import biotite.structure as struc
-import biotite.structure.io as strucio
+import biotite.structure.io.pdbx as pdbx
 from biotite.structure.io.pdb import PDBFile
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
@@ -464,14 +464,17 @@ def main():
 
     logging.info(f"Loading structure with biotite from {args.pdb_file}...")
     try:
-        # Explicitly use the PDB file parser to avoid issues with non-standard extensions
-        pdb_f = PDBFile.read(args.pdb_file)
-        # Get only the first model to handle multi-model PDBs
-        # Or you should manually merge multiple models into one 
-        structure = pdb_f.get_structure(model=1)
+        if args.pdb_file.endswith((".cif", ".pdbx")):
+            cif_f = pdbx.CIFFile.read(args.pdb_file)
+            structure = pdbx.get_structure(cif_f, model=1)
+        else:
+            pdb_f = PDBFile.read(args.pdb_file)
+            structure = pdb_f.get_structure(model=1)
     except Exception as e:
-        logging.error(f"Could not load structure with biotite: {e}")
-        return print(f"Error: Could not load PDB file with biotite.")
+        logging.error(f"Could not load structure file: {e}")
+        print(f"Error: Could not load structure file '{args.pdb_file}'.")
+        print(f"Reason: {e}")
+        return
 
     logging.info("Identifying histones...")
     sequences = get_chain_sequences(structure)

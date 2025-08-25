@@ -330,21 +330,21 @@ def generate_pymol_script(output_prefix, ncp_configs, ncp_bases, all_params, his
         ncp_name = f"ncp{ncp_id}"
         color = colors[i % len(colors)]
 
-        h_selectors = [f"(chain {c} and resi {HISTONE_CORE_RANGES[histone_map[c]][0]}-{HISTONE_CORE_RANGES[histone_map[c]][1]})") for c in ncp_def['histone_chains']]
-        d_selectors = [f"(chain {seg[0]} and resi {int(seg[1])}-{int(seg[2])})") for seg in ncp_def['dna_segments']]
+        h_selectors = [f"(chain {c} and resi {HISTONE_CORE_RANGES[histone_map[c]][0]}-{HISTONE_CORE_RANGES[histone_map[c]][1]})" for c in ncp_def['histone_chains']]
+        d_selectors = [f"(chain {seg[0]} and resi {int(seg[1])}-{int(seg[2])})" for seg in ncp_def['dna_segments']]
         script_lines.append(f"select {ncp_name}, {' or '.join(h_selectors + d_selectors)}")
         script_lines.append(f"color {color}, {ncp_name}")
 
         # Add H3 pair selection for each NCP
         h3_chains = [c for c in ncp_def['histone_chains'] if histone_map.get(c) == 'H3']
         if len(h3_chains) >= 2:
-            h3_selector = f"(chain {h3_chains[0]} and resi {HISTONE_CORE_RANGES['H3'][0]}-{HISTONE_CORE_RANGES['H3'][1]}) or (chain {h3_chains[1]} and resi {HISTONE_CORE_RANGES['H3'][0]}-{HISTONE_CORE_RANGES['H3'][1]})")
+            h3_selector = f"(chain {h3_chains[0]} and resi {HISTONE_CORE_RANGES['H3'][0]}-{HISTONE_CORE_RANGES['H3'][1]}) or (chain {h3_chains[1]} and resi {HISTONE_CORE_RANGES['H3'][0]}-{HISTONE_CORE_RANGES['H3'][1]})"
             script_lines.append(f"select h3_pair_{ncp_id}, {h3_selector}")
 
         # Add dyad selection for each NCP
         if ncp_def.get('central_bp'):
             bp1, bp2 = ncp_def['central_bp']
-            dyad_selector = f"(chain {bp1[0]} and resi {bp1[1]}) or (chain {bp2[0]} and resi {bp2[1]})")
+            dyad_selector = f"(chain {bp1[0]} and resi {bp1[1]}) or (chain {bp2[0]} and resi {bp2[1]})"
             script_lines.append(f"select dyad_{ncp_id}, {dyad_selector}")
             script_lines.append(f"color magenta, dyad_{ncp_id}")
             script_lines.append(f"show sticks, dyad_{ncp_id}")

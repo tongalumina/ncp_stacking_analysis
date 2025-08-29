@@ -1,0 +1,28 @@
+NCP Stacking Analysis Results for 1zbb_ba
+
+--- NCP 1 - NCP 2 ---
+Distance                 :    58.08 A
+Rise                     :    56.03 A
+Shift                    :    15.28 A
+Shift Orientation        :    59.37 deg
+Symmetry Axes Orientation:   -20.61 deg
+Tilt                     :     7.69 deg
+Tilt Direction           :   -18.66 deg
+
+--- NCP 2 - NCP 3 ---
+Distance                 :   148.21 A
+Rise                     :    12.06 A
+Shift                    :   147.72 A
+Shift Orientation        :   -12.68 deg
+Symmetry Axes Orientation:   170.76 deg
+Tilt                     :    80.42 deg
+Tilt Direction           :   -98.72 deg
+
+--- NCP 3 - NCP 4 ---
+Distance                 :    58.08 A
+Rise                     :    55.95 A
+Shift                    :    15.57 A
+Shift Orientation        :    71.80 deg
+Symmetry Axes Orientation:   -20.75 deg
+Tilt                     :     7.69 deg
+Tilt Direction           :    -1.94 deg
